@@ -36,8 +36,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "hidapi/hidapi.h"
 #include "footswitch_msgs/msg/footswitch_state.hpp"
+#include "hidapi/hidapi.h"
 #include "rclcpp/rclcpp.hpp"
 
 namespace footswitch_driver
@@ -50,18 +50,18 @@ using footswitch_msgs::msg::FootswitchState;
 class FootSwitch : public rclcpp::Node
 {
 public:
-  explicit FootSwitch(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
-  ~FootSwitch();
+    explicit FootSwitch(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
+    ~FootSwitch();
 
 private:
-  rclcpp::TimerBase::SharedPtr tmr_update_state_;
-  hid_device * handle_;
-  rclcpp::Publisher<FootswitchState>::SharedPtr pub_footswitch_state_;
-  int update_period_ms_{100};  // ms
-  std::array<bool, 3> previous_state_{};
-  void update_state();
+    rclcpp::TimerBase::SharedPtr tmr_update_state_;
+    hid_device *handle_;
+    rclcpp::Publisher<FootswitchState>::SharedPtr pub_footswitch_state_;
+    int update_period_ms_{ 100 }; // ms
+    std::array<bool, 3> previous_state_{};
+    void update_state();
 };
 
-}  // namespace footswitch_driver
+} // namespace footswitch_driver
 
-#endif  // FOOTSWITCH_DRIVER__FOOTSWITCH_DRIVER_HPP_
+#endif // FOOTSWITCH_DRIVER__FOOTSWITCH_DRIVER_HPP_
