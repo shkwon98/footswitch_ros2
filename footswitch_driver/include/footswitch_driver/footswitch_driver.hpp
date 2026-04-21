@@ -59,7 +59,6 @@ private:
   rclcpp::Publisher<FootswitchState>::SharedPtr pub_footswitch_state_;
   int update_period_ms_{100};  // ms
   std::array<bool, 3> previous_state_{};
-  bool state_initialized_{false};
   void update_state();
 };
 

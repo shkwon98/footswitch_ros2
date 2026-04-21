@@ -26,6 +26,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <algorithm>
 #include <memory>
 
 #include "footswitch_driver/footswitch_driver.hpp"
@@ -33,19 +34,47 @@
 namespace footswitch_driver
 {
 
+namespace
+{
+
+constexpr int kKeyboardInterfaceNumber = 0;
+
+hid_device * open_footswitch_keyboard_interface()
+{
+  hid_device_info * devices = hid_enumerate(VEND_ID, PROD_ID);
+  hid_device_info * current = devices;
+  hid_device * handle = nullptr;
+
+  while (current != nullptr) {
+    if (current->interface_number == kKeyboardInterfaceNumber) {
+      handle = hid_open_path(current->path);
+      break;
+    }
+    current = current->next;
+  }
+
+  hid_free_enumeration(devices);
+  return handle;
+}
+
+}  // namespace
+
 FootSwitch::FootSwitch(const rclcpp::NodeOptions & options)
 : rclcpp::Node("footswitch_node")
 {
   // Initialize the hidapi library
   hid_init();
 
-  // Open the device using the VID, PID
-  handle_ = hid_open(VEND_ID, PROD_ID, NULL);
+  // Open the keyboard HID interface explicitly. This device exposes multiple
+  // interfaces under the same VID/PID, and opening an arbitrary one leads to
+  // incorrect pedal decoding.
+  handle_ = open_footswitch_keyboard_interface();
   if (!handle_) {
     RCLCPP_FATAL(
       get_logger(),
-      "Unable to open device with VID '%x' and PID '%x'. Exiting...",
-      VEND_ID, PROD_ID);
+      "Unable to open keyboard interface for device with VID '%x' and PID '%x'. Exiting...",
+      VEND_ID,
+      PROD_ID);
     hid_exit();
     ::exit(1);
   }
@@ -87,20 +116,46 @@ FootSwitch::~FootSwitch()
 
 void FootSwitch::update_state()
 {
-  int res = 0;
+  std::array<bool, 3> current_state = previous_state_;
   unsigned char buf[65] = {0};
   int i = 0;
 
-  // Continue to poll if no readings have been received
-  while (res == 0 && rclcpp::ok()) {
-    res = hid_read(handle_, buf, sizeof(buf));
+  // Drain all queued HID reports during this update window. If no new report
+  // arrives, keep the previous state instead of forcing an immediate release.
+  while (rclcpp::ok()) {
+    const int res = hid_read(handle_, buf, sizeof(buf));
     if (res < 0) {
       RCLCPP_ERROR(get_logger(), "Unable to read from footswitch: %ls", hid_error(handle_));
       break;
     }
 
+    if (res > 0) {
+      std::array<bool, 3> parsed_state = {false, false, false};
+
+      // Parse keycode slots and map key values to the left/middle/right pedals.
+      // Some devices prepend a report-id byte, shifting keycodes by +1.
+      const int keycode_start = (res >= 9) ? 3 : 2;
+      const int keycode_end = std::min(res, keycode_start + 6);
+      for (int byte_idx = keycode_start; byte_idx < keycode_end; byte_idx++) {
+        switch (buf[byte_idx]) {
+          case 4:
+            parsed_state[0] = true;
+            break;
+          case 5:
+            parsed_state[1] = true;
+            break;
+          case 6:
+            parsed_state[2] = true;
+            break;
+          default:
+            break;
+        }
+      }
+
+      current_state = parsed_state;
+    }
+
     i++;
-    // Break after update period
     if (i >= update_period_ms_) {
       break;
     }
@@ -108,27 +163,12 @@ void FootSwitch::update_state()
     get_clock()->sleep_for(std::chrono::milliseconds(1));
   }
 
-  if (res > 0) {
-    std::array<bool, 3> current_state = {false, false, false};
-    // Parse first three keycode slots and treat non-zero keycodes as pressed.
-    // Some devices prepend a report-id byte, shifting keycodes by +1.
-    const int keycode_start = (res >= 9) ? 3 : 2;
-    for (int pedal_idx = 0; pedal_idx < 3; pedal_idx++) {
-      const int byte_idx = keycode_start + pedal_idx;
-      if (byte_idx < res && buf[byte_idx] != 0) {
-        current_state[pedal_idx] = true;
-      }
-    }
-
-    // Only publish when the pedal state transitions to avoid duplicates.
-    if (!state_initialized_ || current_state != previous_state_) {
-      FootswitchState state;
-      state.state = current_state;
-      state.header.stamp = now();
-      pub_footswitch_state_->publish(state);
-      previous_state_ = current_state;
-      state_initialized_ = true;
-    }
+  if (current_state != previous_state_) {
+    FootswitchState state;
+    state.state = current_state;
+    state.header.stamp = now();
+    pub_footswitch_state_->publish(state);
+    previous_state_ = current_state;
   }
 }
 
