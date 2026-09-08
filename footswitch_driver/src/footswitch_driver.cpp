@@ -26,10 +26,11 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include "footswitch_driver/footswitch_driver.hpp"
+
 #include <algorithm>
 #include <memory>
-
-#include "footswitch_driver/footswitch_driver.hpp"
+#include <stdexcept>
 
 namespace footswitch_driver
 {
@@ -62,10 +63,13 @@ hid_device *open_footswitch_keyboard_interface()
 } // namespace
 
 FootSwitch::FootSwitch(const rclcpp::NodeOptions &options)
-    : rclcpp::Node("footswitch_node")
+    : rclcpp::Node("footswitch_node", options)
 {
     // Initialize the hidapi library
-    hid_init();
+    if (hid_init() < 0)
+    {
+        throw std::runtime_error("Unable to initialize HIDAPI");
+    }
 
     // Open the keyboard HID interface explicitly. This device exposes multiple
     // interfaces under the same VID/PID, and opening an arbitrary one leads to
@@ -73,27 +77,46 @@ FootSwitch::FootSwitch(const rclcpp::NodeOptions &options)
     handle_ = open_footswitch_keyboard_interface();
     if (!handle_)
     {
-        RCLCPP_FATAL(get_logger(), "Unable to open keyboard interface for device with VID '%x' and PID '%x'. Exiting...",
-                     VEND_ID, PROD_ID);
+        RCLCPP_FATAL(
+            get_logger(),
+            "Unable to open keyboard interface for device with VID '%x' and PID '%x'. Exiting...",
+            VEND_ID, PROD_ID);
         hid_exit();
         ::exit(1);
     }
 
     // Set the hid_read() function to be non-blocking.
-    hid_set_nonblocking(handle_, 1);
+    if (hid_set_nonblocking(handle_, 1) < 0)
+    {
+        hid_close(handle_);
+        hid_exit();
+        throw std::runtime_error("Unable to enable nonblocking footswitch input");
+    }
 
     int update_rate;
     declare_parameter("update_rate", 10);
     get_parameter("update_rate", update_rate);
+    if (update_rate <= 0 || update_rate > 1000)
+    {
+        hid_close(handle_);
+        hid_exit();
+        throw std::invalid_argument("update_rate must be in [1, 1000] Hz");
+    }
 
-    update_period_ms_ = static_cast<int64_t>((1.0 / static_cast<float>(update_rate)) * 1'000);
+    update_period_ms_ = 1000 / update_rate;
 
-    pub_footswitch_state_ = create_publisher<FootswitchState>("state", 10);
+    // Assert health after successful HID polling, even when no pedal changes.
+    const auto qos =
+        rclcpp::QoS(10)
+            .liveliness(RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC)
+            .liveliness_lease_duration(std::chrono::milliseconds(3 * update_period_ms_));
+    pub_footswitch_state_ = create_publisher<FootswitchState>("state", qos);
 
-    RCLCPP_INFO(get_logger(), "Publishing footswitch state on topic '%s'.", pub_footswitch_state_->get_topic_name());
+    RCLCPP_INFO(get_logger(), "Publishing footswitch state on topic '%s'.",
+                pub_footswitch_state_->get_topic_name());
 
-    tmr_update_state_ =
-        create_wall_timer(std::chrono::milliseconds(update_period_ms_), std::bind(&FootSwitch::update_state, this));
+    tmr_update_state_ = create_wall_timer(std::chrono::milliseconds(update_period_ms_),
+                                          std::bind(&FootSwitch::update_state, this));
 
     RCLCPP_INFO(get_logger(), "Initialized Footswitch driver.");
 }
@@ -113,66 +136,75 @@ FootSwitch::~FootSwitch()
 
 void FootSwitch::update_state()
 {
-    std::array<bool, 3> current_state = previous_state_;
-    unsigned char buf[65] = { 0 };
-    int i = 0;
+    unsigned char buf[65] = {0};
 
-    // Drain all queued HID reports during this update window. If no new report
-    // arrives, keep the previous state instead of forcing an immediate release.
-    while (rclcpp::ok())
+    // Publish each transition: the final report alone can hide a short press.
+    // Bound work per callback and leave waiting to the wall timer.
+    for (int i = 0; i < 32 && rclcpp::ok(); ++i)
     {
         const int res = hid_read(handle_, buf, sizeof(buf));
         if (res < 0)
         {
             RCLCPP_ERROR(get_logger(), "Unable to read from footswitch: %ls", hid_error(handle_));
+            // Let subscribers detect loss of HID health without inventing pedal states.
+            tmr_update_state_->cancel();
+            return;
+        }
+        if (res == 0)
+        {
             break;
         }
-
-        if (res > 0)
+        if (res != 8 && res != 9)
         {
-            std::array<bool, 3> parsed_state = { false, false, false };
+            continue;
+        }
 
-            // Parse keycode slots and map key values to the left/middle/right pedals.
-            // Some devices prepend a report-id byte, shifting keycodes by +1.
-            const int keycode_start = (res >= 9) ? 3 : 2;
-            const int keycode_end = std::min(res, keycode_start + 6);
-            for (int byte_idx = keycode_start; byte_idx < keycode_end; byte_idx++)
+        std::array<bool, 3> parsed_state = {false, false, false};
+
+        // Some devices prepend a report ID. Ignore keyboard rollover/error reports.
+        const int keycode_start = res - 6;
+        if (std::any_of(buf + keycode_start, buf + res,
+                        [](unsigned char key) { return key >= 1 && key <= 3; }))
+        {
+            continue;
+        }
+        for (int byte_idx = keycode_start; byte_idx < res; ++byte_idx)
+        {
+            switch (buf[byte_idx])
             {
-                switch (buf[byte_idx])
-                {
-                case 4:
-                    parsed_state[0] = true;
-                    break;
-                case 5:
-                    parsed_state[1] = true;
-                    break;
-                case 6:
-                    parsed_state[2] = true;
-                    break;
-                default:
-                    break;
-                }
+            case 0x04: // A
+            case 0x1e: // 1
+            case 0x59: // Keypad 1
+                parsed_state[0] = true;
+                break;
+            case 0x05: // B
+            case 0x1f: // 2
+            case 0x5a: // Keypad 2
+                parsed_state[1] = true;
+                break;
+            case 0x06: // C
+            case 0x20: // 3
+            case 0x5b: // Keypad 3
+                parsed_state[2] = true;
+                break;
+            default:
+                break;
             }
-
-            current_state = parsed_state;
         }
 
-        i++;
-        if (i >= update_period_ms_)
+        if (parsed_state != previous_state_)
         {
-            break;
+            FootswitchState state;
+            state.state = parsed_state;
+            state.header.stamp = now();
+            pub_footswitch_state_->publish(state);
+            previous_state_ = parsed_state;
         }
-
-        get_clock()->sleep_for(std::chrono::milliseconds(1));
     }
-
-    if (current_state != previous_state_)
+    if (!pub_footswitch_state_->assert_liveliness())
     {
-        FootswitchState state;
-        state.state = current_state;
-        state.header.stamp = now();
-        pub_footswitch_state_->publish(state);
-        previous_state_ = current_state;
+        RCLCPP_ERROR(get_logger(), "Unable to assert footswitch input health; restart the driver");
+        tmr_update_state_->cancel();
     }
 }
 

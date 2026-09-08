@@ -37,6 +37,10 @@ install(FILES ../scripts/19-footswitch.rules DESTINATION share/${PROJECT_NAME}/u
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
+  enable_testing()
+  add_executable(test_reports test/test_reports.cpp)
+  target_link_libraries(test_reports footswitch_driver)
+  add_test(NAME reports COMMAND test_reports --ros-args -r __ns:=/footswitch_test)
 endif()
 
 ament_package()

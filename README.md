@@ -20,6 +20,29 @@ git clone https://github.com/shkwon98/footswitch_ros2.git src/footswitch_ros2
 rosdep install --from-paths src/footswitch_ros2 --ignore-src -r -y
 ```
 
+## Pedal Key Configuration
+
+The driver decodes USB HID key reports, not physical switch IDs. Before use,
+configure the device's left/middle/right pedals as A/B/C or 1/2/3:
+
+| Pedal | Accepted device key | Published field |
+| --- | --- | --- |
+| Left | A or 1 | `state[0]` |
+| Middle | B or 2 | `state[1]` |
+| Right | C or 3 | `state[2]` |
+
+Both number-row and keypad 1/2/3 are accepted; no ROS parameter selects the set.
+Other keys and mouse/media actions are not decoded as pedal presses.
+
+If the device has different assignments, use the
+[PCsensor configuration software](https://pcsensor.com/download/) to set each
+pedal to a single keyboard key and save the assignments to the device. Do not
+use text macros or automatic press/release sequences. With robot control stopped,
+check each pedal's key in a text editor before starting the ROS driver.
+
+The driver does not reprogram the device. The udev rule below only grants device
+access; it does not change key assignments.
+
 ## udev Rule
 
 `hidraw` access is usually restricted to `root`, so install the bundled udev rule before building or running the driver as a normal user.
@@ -49,6 +72,19 @@ ros2 run footswitch_driver footswitch_driver_node
 
 ## Interface
 
-- Topic: `/footswitch_node/state`
+- Topic: `state` (relative to the node namespace; `/state` by default)
 - Type: `footswitch_msgs/msg/FootswitchState`
 - Field: `bool[3] state` (`state[0]`, `state[1]`, `state[2]` for each pedal)
+
+Each changed HID report is published, including a press and release received
+within one polling interval. Holding a pedal does not repeat its state message.
+`update_rate` controls HID polling in Hz (default `10`, range `1`–`1000`).
+
+State QoS is reliable, volatile, keep-last-10, with manual-by-topic liveliness.
+The driver asserts liveliness after successful polling, even without a state
+change. Its lease is three polling intervals (`0.3 s` at the default rate).
+A USB read failure stops polling and liveliness assertions until restart;
+it does not synthesize a pedal press. Consumers can use the ROS liveliness-lost
+notification to implement their own stop policy.
+For portable loss detection, request manual-by-topic liveliness with a finite
+lease at least as long as the publisher's lease (e.g. `0.5 s` for default polling).
