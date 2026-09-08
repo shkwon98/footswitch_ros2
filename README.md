@@ -30,6 +30,7 @@ cd <YOUR_ROS2_WORKSPACE>/src/footswitch_ros2
 ```
 
 Unplug and reconnect the footswitch after applying the rule.
+The rule grants access to the active local session, not every user.
 
 ## Build
 

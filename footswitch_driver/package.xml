@@ -13,7 +13,6 @@
 
   <depend>footswitch_msgs</depend>
   <depend>libhidapi-dev</depend>
-  <depend>libusb-1.0-dev</depend>
   <depend>rclcpp_components</depend>
   <depend>rclcpp</depend>
 
