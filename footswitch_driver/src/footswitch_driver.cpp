@@ -29,7 +29,14 @@
 #include "footswitch_driver/footswitch_driver.hpp"
 
 #include <algorithm>
+#include <filesystem>
+#include <glob.h>
+#include <fcntl.h>
+#include <linux/input.h>
 #include <memory>
+#include <sys/ioctl.h>
+#include <system_error>
+#include <vector>
 #include <stdexcept>
 
 namespace footswitch_driver
@@ -40,7 +47,7 @@ namespace
 
 constexpr int kKeyboardInterfaceNumber = 0;
 
-hid_device *open_footswitch_keyboard_interface()
+hid_device *open_footswitch_keyboard_interface(std::string &device_path)
 {
     hid_device_info *devices = hid_enumerate(VEND_ID, PROD_ID);
     hid_device_info *current = devices;
@@ -51,6 +58,10 @@ hid_device *open_footswitch_keyboard_interface()
         if (current->interface_number == kKeyboardInterfaceNumber)
         {
             handle = hid_open_path(current->path);
+            if (handle)
+            {
+                device_path = current->path;
+            }
             break;
         }
         current = current->next;
@@ -58,6 +69,53 @@ hid_device *open_footswitch_keyboard_interface()
 
     hid_free_enumeration(devices);
     return handle;
+}
+
+std::vector<int> grab_keyboard_inputs(const std::string &hidraw_path)
+{
+    const auto pattern = "/sys/class/hidraw/" +
+        std::filesystem::path(hidraw_path).filename().string() + "/device/input/input*/event*";
+    glob_t matches{};
+    const int result = glob(pattern.c_str(), 0, nullptr, &matches);
+    if (result != 0)
+    {
+        globfree(&matches);
+        throw std::runtime_error("No input event devices found for footswitch " + hidraw_path);
+    }
+
+    std::vector<int> inputs;
+    try
+    {
+        inputs.reserve(matches.gl_pathc);
+        for (std::size_t index = 0; index < matches.gl_pathc; ++index)
+        {
+            const auto device = std::filesystem::path("/dev/input") /
+                std::filesystem::path(matches.gl_pathv[index]).filename();
+            const int fd = open(device.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+            if (fd < 0)
+            {
+                throw std::system_error(errno, std::generic_category(),
+                    "Cannot open " + device.string() + "; install the footswitch udev rule");
+            }
+            inputs.push_back(fd);
+            if (ioctl(fd, EVIOCGRAB, 1) < 0)
+            {
+                throw std::system_error(errno, std::generic_category(),
+                    "Cannot exclusively grab " + device.string());
+            }
+        }
+    }
+    catch (...)
+    {
+        for (const int fd : inputs)
+        {
+            close(fd);
+        }
+        globfree(&matches);
+        throw;
+    }
+    globfree(&matches);
+    return inputs;
 }
 
 } // namespace
@@ -74,7 +132,8 @@ FootSwitch::FootSwitch(const rclcpp::NodeOptions &options)
     // Open the keyboard HID interface explicitly. This device exposes multiple
     // interfaces under the same VID/PID, and opening an arbitrary one leads to
     // incorrect pedal decoding.
-    handle_ = open_footswitch_keyboard_interface();
+    std::string device_path;
+    handle_ = open_footswitch_keyboard_interface(device_path);
     if (!handle_)
     {
         RCLCPP_FATAL(
@@ -118,12 +177,30 @@ FootSwitch::FootSwitch(const rclcpp::NodeOptions &options)
     tmr_update_state_ = create_wall_timer(std::chrono::milliseconds(update_period_ms_),
                                           std::bind(&FootSwitch::update_state, this));
 
-    RCLCPP_INFO(get_logger(), "Initialized Footswitch driver.");
+    // Grabbing evdev blocks desktop key delivery while HIDAPI continues reading reports.
+    try
+    {
+        input_fds_ = grab_keyboard_inputs(device_path);
+    }
+    catch (...)
+    {
+        hid_close(handle_);
+        hid_exit();
+        throw;
+    }
+
+    RCLCPP_INFO(get_logger(), "Initialized Footswitch driver; desktop key input suppressed.");
 }
 
 FootSwitch::~FootSwitch()
 {
     RCLCPP_INFO(get_logger(), "Exiting Footswitch driver.");
+    // Closing evdev descriptors releases exclusive input ownership, including on process exit.
+    for (const int fd : input_fds_)
+    {
+        close(fd);
+    }
+
     // Close the device
     if (handle_)
     {

@@ -53,7 +53,8 @@ cd <YOUR_ROS2_WORKSPACE>/src/footswitch_ros2
 ```
 
 Unplug and reconnect the footswitch after applying the rule.
-The rule grants access to the active local session.
+The rule grants access to the active local session. Reinstall it if upgrading
+from an older version. While the driver runs, pedal keys are not sent to desktop applications.
 
 ## Build
 
