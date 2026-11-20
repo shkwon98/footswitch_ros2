@@ -46,6 +46,7 @@ namespace
 {
 
 constexpr int kKeyboardInterfaceNumber = 0;
+constexpr auto kReconnectDelay = std::chrono::seconds(1);
 
 hid_device *open_footswitch_keyboard_interface(std::string &device_path)
 {
@@ -57,11 +58,8 @@ hid_device *open_footswitch_keyboard_interface(std::string &device_path)
     {
         if (current->interface_number == kKeyboardInterfaceNumber)
         {
-            handle = hid_open_path(current->path);
-            if (handle)
-            {
-                device_path = current->path;
-            }
+            device_path = current->path;
+            handle = hid_open_path(device_path.c_str());
             break;
         }
         current = current->next;
@@ -123,96 +121,119 @@ std::vector<int> grab_keyboard_inputs(const std::string &hidraw_path)
 FootSwitch::FootSwitch(const rclcpp::NodeOptions &options)
     : rclcpp::Node("footswitch_node", options)
 {
-    // Initialize the hidapi library
+    const int update_rate = declare_parameter("update_rate", 10);
+    if (update_rate <= 0 || update_rate > 1000)
+    {
+        throw std::invalid_argument("update_rate must be in [1, 1000] Hz");
+    }
+    update_period_ms_ = 1000 / update_rate;
+
     if (hid_init() < 0)
     {
         throw std::runtime_error("Unable to initialize HIDAPI");
     }
 
-    // Open the keyboard HID interface explicitly. This device exposes multiple
-    // interfaces under the same VID/PID, and opening an arbitrary one leads to
-    // incorrect pedal decoding.
-    std::string device_path;
-    handle_ = open_footswitch_keyboard_interface(device_path);
-    if (!handle_)
+    tmr_update_state_ = create_wall_timer(std::chrono::milliseconds(update_period_ms_),
+                                          std::bind(&FootSwitch::update_state, this));
+    RCLCPP_INFO(get_logger(), "Waiting for a PCsensor footswitch.");
+}
+
+void FootSwitch::try_connect()
+{
+    const auto current = std::chrono::steady_clock::now();
+    if (current < next_connection_attempt_)
     {
-        RCLCPP_FATAL(
-            get_logger(),
-            "Unable to open keyboard interface for device with VID '%x' and PID '%x'. Exiting...",
-            VEND_ID, PROD_ID);
-        hid_exit();
-        ::exit(1);
+        return;
+    }
+    next_connection_attempt_ = current + kReconnectDelay;
+
+    std::string device_path;
+    std::unique_ptr<hid_device, decltype(&hid_close)> device(
+        open_footswitch_keyboard_interface(device_path), hid_close);
+    if (!device)
+    {
+        if (!device_path.empty())
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), steady_clock_, 5000,
+                "Cannot open %s. Check the footswitch udev rule.", device_path.c_str());
+        }
+        return;
     }
 
     // Set the hid_read() function to be non-blocking.
-    if (hid_set_nonblocking(handle_, 1) < 0)
+    if (hid_set_nonblocking(device.get(), 1) < 0)
     {
-        hid_close(handle_);
-        hid_exit();
-        throw std::runtime_error("Unable to enable nonblocking footswitch input");
+        RCLCPP_WARN_THROTTLE(get_logger(), steady_clock_, 5000,
+            "Cannot enable nonblocking footswitch input: %ls", hid_error(device.get()));
+        return;
     }
 
-    int update_rate;
-    declare_parameter("update_rate", 10);
-    get_parameter("update_rate", update_rate);
-    if (update_rate <= 0 || update_rate > 1000)
-    {
-        hid_close(handle_);
-        hid_exit();
-        throw std::invalid_argument("update_rate must be in [1, 1000] Hz");
-    }
-
-    update_period_ms_ = 1000 / update_rate;
-
-    // Assert health after successful HID polling, even when no pedal changes.
-    const auto qos =
-        rclcpp::QoS(10)
-            .liveliness(RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC)
-            .liveliness_lease_duration(std::chrono::milliseconds(3 * update_period_ms_));
-    pub_footswitch_state_ = create_publisher<FootswitchState>("state", qos);
-
-    RCLCPP_INFO(get_logger(), "Publishing footswitch state on topic '%s'.",
-                pub_footswitch_state_->get_topic_name());
-
-    tmr_update_state_ = create_wall_timer(std::chrono::milliseconds(update_period_ms_),
-                                          std::bind(&FootSwitch::update_state, this));
-
-    // Grabbing evdev blocks desktop key delivery while HIDAPI continues reading reports.
+    // Grabbing evdev blocks desktop key delivery while HIDAPI reads reports.
     try
     {
         input_fds_ = grab_keyboard_inputs(device_path);
     }
-    catch (...)
+    catch (const std::runtime_error &error)
     {
-        hid_close(handle_);
-        hid_exit();
-        throw;
+        RCLCPP_WARN_THROTTLE(get_logger(), steady_clock_, 5000, "%s", error.what());
+        return;
     }
 
-    RCLCPP_INFO(get_logger(), "Initialized Footswitch driver; desktop key input suppressed.");
+    // Tie the publisher's lifetime to the USB session so readers see a disconnect.
+    const auto qos =
+        rclcpp::QoS(10)
+            .liveliness(RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_TOPIC)
+            .liveliness_lease_duration(std::chrono::milliseconds(3 * update_period_ms_));
+    try
+    {
+        pub_footswitch_state_ = create_publisher<FootswitchState>("state", qos);
+    }
+    catch (...)
+    {
+        disconnect();
+        throw;
+    }
+    handle_ = device.release();
+    RCLCPP_INFO(get_logger(), "Footswitch connected. Publishing state on '%s'.",
+                pub_footswitch_state_->get_topic_name());
 }
 
 FootSwitch::~FootSwitch()
 {
-    RCLCPP_INFO(get_logger(), "Exiting Footswitch driver.");
+    disconnect();
+    hid_exit();
+}
+
+void FootSwitch::disconnect()
+{
+    pub_footswitch_state_.reset();
+    previous_state_.reset();
     // Closing evdev descriptors releases exclusive input ownership, including on process exit.
     for (const int fd : input_fds_)
     {
         close(fd);
     }
+    input_fds_.clear();
 
-    // Close the device
     if (handle_)
     {
         hid_close(handle_);
+        handle_ = nullptr;
     }
-
-    // Finalize the hidapi library
-    hid_exit();
+    next_connection_attempt_ = std::chrono::steady_clock::now() + kReconnectDelay;
 }
 
 void FootSwitch::update_state()
 {
+    if (!handle_)
+    {
+        try_connect();
+        if (!handle_)
+        {
+            return;
+        }
+    }
+
     unsigned char buf[65] = {0};
 
     // Publish each transition: the final report alone can hide a short press.
@@ -222,9 +243,9 @@ void FootSwitch::update_state()
         const int res = hid_read(handle_, buf, sizeof(buf));
         if (res < 0)
         {
-            RCLCPP_ERROR(get_logger(), "Unable to read from footswitch: %ls", hid_error(handle_));
-            // Let subscribers detect loss of HID health without inventing pedal states.
-            tmr_update_state_->cancel();
+            RCLCPP_WARN(get_logger(), "Footswitch input lost. Waiting to reconnect: %ls",
+                hid_error(handle_));
+            disconnect();
             return;
         }
         if (res == 0)
@@ -269,7 +290,7 @@ void FootSwitch::update_state()
             }
         }
 
-        if (parsed_state != previous_state_)
+        if (!previous_state_ || parsed_state != *previous_state_)
         {
             FootswitchState state;
             state.state = parsed_state;
@@ -280,8 +301,8 @@ void FootSwitch::update_state()
     }
     if (!pub_footswitch_state_->assert_liveliness())
     {
-        RCLCPP_ERROR(get_logger(), "Unable to assert footswitch input health; restart the driver");
-        tmr_update_state_->cancel();
+        RCLCPP_WARN(get_logger(), "Cannot report footswitch input health. Reconnecting.");
+        disconnect();
     }
 }
 

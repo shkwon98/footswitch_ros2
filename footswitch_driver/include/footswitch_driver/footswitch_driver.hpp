@@ -30,6 +30,8 @@
 #define FOOTSWITCH_DRIVER__FOOTSWITCH_DRIVER_HPP_
 
 #include <array>
+#include <chrono>
+#include <optional>
 #include <vector>
 #include <errno.h>
 #include <stdio.h>
@@ -56,11 +58,15 @@ public:
 
 private:
     rclcpp::TimerBase::SharedPtr tmr_update_state_;
-    hid_device *handle_;
+    hid_device *handle_{nullptr};
     std::vector<int> input_fds_;
     rclcpp::Publisher<FootswitchState>::SharedPtr pub_footswitch_state_;
     int update_period_ms_{ 100 }; // ms
-    std::array<bool, 3> previous_state_{};
+    std::optional<std::array<bool, 3>> previous_state_;
+    std::chrono::steady_clock::time_point next_connection_attempt_{};
+    rclcpp::Clock steady_clock_{RCL_STEADY_TIME};
+    void try_connect();
+    void disconnect();
     void update_state();
 };
 

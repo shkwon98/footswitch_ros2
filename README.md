@@ -69,15 +69,18 @@ after startup or input loss establishes the initial pedal state.
 The driver publishes `footswitch_msgs/msg/FootswitchState` on the relative
 `state` topic, or `/state` with no namespace. The mapper launch remaps this
 internal link to `/footswitch/_state`. The state array lists left, middle, and
-right pedals in order. The driver publishes changed HID reports, including
-transitions within one poll interval. `update_rate` is the HID polling rate
+right pedals in order. The driver publishes the first valid HID report and
+subsequent changes, including transitions within one poll interval.
+`update_rate` is the HID polling rate
 in Hz. It defaults to 10 and accepts 1 through 1000.
 
 Raw state QoS is reliable, volatile, keep-last-10 with manual-by-topic
 liveliness. The driver asserts liveliness after each successful poll.
-A USB read failure stops polling and liveliness assertions until restart. The
-publisher's lease is three poll intervals. The mapper uses a 0.5 s lease and
-checks the report timestamp against its ROS clock.
+If the USB device is absent, the driver waits and retries the connection
+every second. On a read failure it closes the device and removes the raw state
+publisher. It creates a new publisher when the device reconnects. The publisher's
+lease is three poll intervals. The mapper uses a 0.5 s lease and checks the
+report timestamp against its ROS clock.
 
 ## License
 
