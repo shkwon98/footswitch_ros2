@@ -59,12 +59,14 @@ ros2 run footswitch_driver footswitch_driver_node
 
 ## ROS interfaces
 
-The mapper initializes each configured output to false and publishes at 10 Hz
-and on matching transitions. Output QoS is reliable, volatile, keep-last-one.
+The mapper publishes one `Bool` per matching transition. Output QoS is
+reliable, volatile, keep-last-one.
 When bindings share a topic, false wins on simultaneous transitions. A held
 pedal with a false binding blocks true transitions on that topic. Loss of
-driver liveliness clears all mapped outputs to false. The first valid report
-after startup or input loss establishes the initial pedal state.
+driver liveliness after a valid baseline sends one `false` to each mapped topic.
+After startup or input loss, a valid report with all pedals up establishes the
+baseline. If the device reports only on changes, the first release can establish
+that baseline.
 
 The driver publishes `footswitch_msgs/msg/FootswitchState` on the relative
 `state` topic, or `/state` with no namespace. The mapper launch remaps this
