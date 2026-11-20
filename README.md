@@ -11,6 +11,7 @@ ROS 2 driver and message interfaces for the 3-pedal PCsensor USB footswitch.
 
 - `footswitch_msgs`: Message definitions (`FootswitchState`)
 - `footswitch_driver`: HID-based ROS 2 node publishing pedal states
+- `footswitch_topic_mapper`: Configurable pedal-to-topic mapping
 
 ## Getting Started
 
@@ -88,3 +89,29 @@ A USB read failure stops polling and liveliness assertions until restart.
 Use the ROS liveliness-lost notification to request a safe stop on input loss.
 For portable loss detection, request manual-by-topic liveliness with a finite
 lease at least as long as the publisher's lease (e.g. `0.5 s` for default polling).
+
+## Map pedals to topics
+
+Build with `colcon build --packages-up-to footswitch_topic_mapper`. To toggle an
+output between true on left-pedal press and false on middle-pedal release:
+
+```bash
+ros2 launch footswitch_topic_mapper mapper.launch.py \
+  left_binding:=press:true:/fixture/enabled \
+  middle_binding:=release:false:/fixture/enabled
+```
+
+Pass `left_binding`, `middle_binding`, and `right_binding` in the form
+`<press|release>:<true|false>:</absolute/topic>`. Each binding defaults to
+empty, which disables that pedal's output. The mapper uses
+`/footswitch/_state` for internal pedal states and publishes
+`std_msgs/msg/Bool` on the configured output topics. Set
+`launch_driver:=false` when replaying pedal states.
+
+Each mapped topic starts at false. The mapper publishes at 10 Hz and on
+matching transitions using reliable, volatile, keep-last-one QoS. When
+multiple bindings target one topic, false wins on simultaneous transitions.
+A held pedal with a false binding blocks true transitions on that topic.
+Driver liveliness loss clears all outputs to false. The first valid report
+establishes the pedal baseline after startup or input loss. The driver and
+mapper clocks must agree for the timestamp freshness check.

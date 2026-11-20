@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Map pedal transitions to Bool state topics while the HID driver is healthy."""
+
+import rclpy
+from footswitch_msgs.msg import FootswitchState
+from rclpy.clock import Clock, ClockType
+from rclpy.duration import Duration
+from rclpy.event_handler import SubscriptionEventCallbacks
+from rclpy.node import Node
+from rclpy.qos import LivelinessPolicy, QoSProfile
+from rclpy.time import Time
+from rclpy.validate_full_topic_name import validate_full_topic_name
+from std_msgs.msg import Bool
+
+
+class PedalTopicMapper(Node):
+    def __init__(self) -> None:
+        super().__init__('pedal_topic_mapper')
+        self.alive = False
+        self.previous = None
+        self.bindings = []
+        self.outputs = {}
+        self.values = {}
+        input_topic = self.resolve_topic_name('state')
+        for pedal, side in enumerate(('left', 'middle', 'right')):
+            name = f'{side}_binding'
+            binding = self.declare_parameter(name, '').value
+            if not binding:
+                continue
+            fields = binding.split(':', 2)
+            if (len(fields) != 3 or fields[0] not in ('press', 'release')
+                    or fields[1] not in ('true', 'false')):
+                raise ValueError(f'{name} expects event:value:/topic')
+            edge, value, topic = fields
+            validate_full_topic_name(topic)
+            resolved = self.resolve_topic_name(topic)
+            if resolved == input_topic:
+                raise ValueError(f'{name} cannot publish to the raw pedal input topic')
+            if resolved not in self.outputs:
+                self.outputs[resolved] = self.create_publisher(Bool, topic, 1)
+                self.values[resolved] = False
+            self.bindings.append((pedal, edge == 'press', value == 'true', resolved))
+
+        state_qos = QoSProfile(depth=10, liveliness=LivelinessPolicy.MANUAL_BY_TOPIC,
+                               liveliness_lease_duration=Duration(seconds=0.5))
+        self.create_subscription(FootswitchState, 'state', self.on_state, state_qos,
+                                 event_callbacks=SubscriptionEventCallbacks(
+                                     liveliness=self.on_liveliness))
+        self.create_timer(0.1, self.publish_values, clock=Clock(clock_type=ClockType.STEADY_TIME))
+
+    def publish_values(self) -> None:
+        for topic, publisher in self.outputs.items():
+            publisher.publish(Bool(data=self.values[topic]))
+
+    def reset_outputs(self) -> None:
+        self.previous = None
+        for topic in self.values:
+            self.values[topic] = False
+        self.publish_values()
+
+    def on_liveliness(self, event) -> None:
+        self.alive = event.alive_count == 1
+        if not self.alive or event.alive_count_change < 0 or event.not_alive_count_change > 0:
+            self.reset_outputs()
+
+    def on_state(self, message: FootswitchState) -> None:
+        if not self.alive:
+            return
+        age = (self.get_clock().now() - Time.from_msg(message.header.stamp)).nanoseconds
+        if not 0 <= age <= 500_000_000:
+            self.reset_outputs()
+            return
+        previous, self.previous = self.previous, tuple(message.state)
+        if previous is None:
+            return
+
+        held_false_topics = {topic for pedal, _, value, topic in self.bindings
+                      if not value and self.previous[pedal]}
+        updates = {}
+        for pedal, pressed, value, topic in self.bindings:
+            if previous[pedal] == self.previous[pedal] or self.previous[pedal] != pressed:
+                continue
+            if value and topic in held_false_topics:
+                continue
+            updates[topic] = updates.get(topic, True) and value
+        for topic, value in updates.items():
+            self.values[topic] = value
+            self.outputs[topic].publish(Bool(data=value))
+
+
+def main() -> None:
+    rclpy.init()
+    node = PedalTopicMapper()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == '__main__':
+    main()
